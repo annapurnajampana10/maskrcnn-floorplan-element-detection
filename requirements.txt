@@ -1,0 +1,12 @@
+torch>=1.12.0
+torchvision>=0.13.0
+detectron2
+opencv-python
+numpy
+matplotlib
+Pillow
+scikit-learn
+tqdm
+lxml
+pyyaml
+beautifulsoup4
