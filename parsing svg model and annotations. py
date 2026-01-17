@@ -1,0 +1,233 @@
+import os, json, re
+from bs4 import BeautifulSoup
+from PIL import Image
+
+# --- Category map ---
+categories = ["Wall", "Door", "Window", "Staircase"]
+category_map = {label: idx + 1 for idx, label in enumerate(categories)}
+
+# --- SVG loader ---
+def extract_svg_root(svg_path):
+    with open(svg_path, 'r', encoding='utf-8') as f:
+        soup = BeautifulSoup(f, "xml")
+    return soup.find("svg")
+
+# --- Bounding box and segmentation parser ---
+def parse_shape_bbox(shape):
+    if shape is None:
+        return None
+
+    coords = []
+    if shape.has_attr("points"):
+        points_raw = shape["points"].strip().split()
+        for p_str in points_raw:
+            if not p_str:
+                continue
+            components = [comp for comp in p_str.split(',') if comp.strip()]
+            if len(components) == 2:
+                try:
+                    coords.append((float(components[0]), float(components[1])))
+                except ValueError:
+                    pass
+            else:
+                pass
+
+    elif shape.has_attr("d"):
+        clean_d = re.sub(r"[MLHVCSQTAZmlhvcsqtaz]", " ", shape["d"])
+        nums = re.findall(r"[-+]?\d*\.\d+|\d+", clean_d)
+        coords = [(float(nums[i]), float(nums[i+1])) for i in range(0, len(nums)-1, 2)]
+
+    else:
+        return None
+
+    if not coords:
+        return None
+
+    xs, ys = zip(*coords)
+    bbox = [min(xs), min(ys), max(xs)-min(xs), max(ys)-min(ys)]
+
+    # Flatten the coordinates for COCO segmentation format
+    segmentation = [val for sublist in coords for val in sublist]
+    return bbox, [segmentation]
+
+# --- Separate parsers ---
+def parse_walls(svg_root):
+    walls = []
+    for g in svg_root.find_all("g", class_=lambda c: c and "Wall" in c):
+        shape = g.find(["polygon","polyline","path"])
+        if shape:
+            bbox_data = parse_shape_bbox(shape)
+            if bbox_data:
+                bbox, segmentation = bbox_data
+                walls.append({"name":"Wall","bbox":bbox, "segmentation": segmentation})
+    return walls
+
+def parse_doors(svg_root):
+    doors = []
+    for g in svg_root.find_all("g", class_=lambda c: c and "Door" in c):
+        shape = g.find(["polygon","polyline","path"])
+        if shape:
+            bbox_data = parse_shape_bbox(shape)
+            if bbox_data:
+                bbox, segmentation = bbox_data
+                doors.append({"name":"Door","bbox":bbox, "segmentation": segmentation})
+    return doors
+
+def parse_windows(svg_root):
+    windows = []
+    for g in svg_root.find_all("g", class_=lambda c: c and "Window" in c):
+        shape = g.find(["polygon","polyline","path"])
+        if shape:
+            bbox_data = parse_shape_bbox(shape)
+            if bbox_data:
+                bbox, segmentation = bbox_data
+                windows.append({"name":"Window","bbox":bbox, "segmentation": segmentation})
+    return windows
+
+def parse_staircases(svg_root):
+    stairs = []
+    for g in svg_root.find_all("g", class_=lambda c: c and "Stairs" in c):
+        shape = g.find(["polygon","polyline","path"])
+        if shape:
+            bbox_data = parse_shape_bbox(shape)
+            if bbox_data:
+                bbox, segmentation = bbox_data
+                stairs.append({"name":"Staircase","bbox":bbox, "segmentation": segmentation})
+    return stairs
+
+
+# --- Unified parser ---
+def parse_elements(svg_root):
+    elements = []
+    elements.extend(parse_walls(svg_root))
+    elements.extend(parse_doors(svg_root))
+    elements.extend(parse_windows(svg_root))
+    elements.extend(parse_staircases(svg_root))
+    return elements
+
+# --- Annotation generator ---
+def generate_annotations(elements, image_id, start_id=1):
+    annotations = []
+    ann_id = start_id
+    for el in elements:
+        category_id = category_map[el["name"]]
+        area = el["bbox"][2] * el["bbox"][3]
+        annotations.append({
+            "id": ann_id,
+            "image_id": image_id,
+            "category_id": category_id,
+            "bbox": el["bbox"],
+            "area": area,
+            "iscrowd": 0,
+            "segmentation": el["segmentation"]
+        })
+        ann_id += 1
+    return annotations
+
+# --- Folder processor ---
+def process_svg_folder(folder_path, output_json):
+    images = []
+    annotations = []
+    image_id = 1000
+    ann_id = 1
+
+    for filename in os.listdir(folder_path):
+        if not filename.endswith(".svg"):
+            continue
+
+        svg_path = os.path.join(folder_path, filename)
+        svg_root = extract_svg_root(svg_path)
+        elements = parse_elements(svg_root)
+
+        images.append({
+            "id": image_id,
+            "file_name": filename,
+            "width": 2048,
+            "height": 2048
+        })
+
+        anns = generate_annotations(elements, image_id, start_id=ann_id)
+        annotations.extend(anns)
+        ann_id += len(anns)
+        image_id += 1
+
+    coco_data = {
+        "images": images,
+        "annotations": annotations,
+        "categories": [{"id": cid, "name": name} for name, cid in category_map.items()]
+    }
+
+    with open(output_json, "w") as f:
+        json.dump(coco_data, f, indent=2)
+    print(f"Saved {output_json} with {len(images)} images and {len(annotations)} annotations.")
+  # --- Split processor ---
+base_dir = "/content/cubicasa_dataset/cubicasa5k"
+
+def process_split(split_name, folder_paths, output_json):
+    images, annotations = [], []
+    image_id, ann_id = 1000, 1
+    present_categories = set()
+
+    category_lookup = {cid: name for name, cid in category_map.items()}
+
+    for relative_path in folder_paths:
+        svg_path = os.path.join(base_dir, relative_path, "model.svg")
+        png_path = os.path.join(base_dir, relative_path, "F1_scaled.png")
+
+        if not os.path.exists(svg_path):
+            print(f" model.svg not found at {svg_path}")
+            continue
+        if not os.path.exists(png_path):
+            print(f" F1_scaled.png not found at {png_path}")
+            continue
+
+        try:
+            with Image.open(png_path) as img:
+                width, height = img.size
+        except Exception as e:
+            print(f" Could not read image size for {png_path}: {e}")
+            continue
+
+        svg_root = extract_svg_root(svg_path)
+        elements = parse_elements(svg_root)
+
+        style = relative_path.split("/")[0]
+
+        images.append({
+            "id": image_id,
+            "file_name": png_path,
+            "style": style,
+            "width": width,
+            "height": height
+        })
+
+        anns = generate_annotations(elements, image_id, start_id=ann_id)
+        annotations.extend(anns)
+        ann_id += len(anns)
+        image_id += 1
+
+        for ann in anns:
+            if ann["category_id"] in category_lookup:
+                present_categories.add(category_lookup[ann["category_id"]])
+            else:
+                print(f" Category ID {ann['category_id']} not found in category_lookup.")
+
+    categories_list = [{"id": cid, "name": name} for name, cid in category_map.items()]
+
+    coco_data = {
+        "info": {
+            "description": f"Floorplan Dataset - {split_name} split",
+            "version": "1.0",
+            "year": 2023,
+            "contributor": "Google Colab",
+            "date_created": ""
+        },
+        "images": images,
+        "annotations": annotations,
+        "categories": categories_list
+    }
+
+    os.makedirs(os.path.dirname(output_json), exist_ok=True)
+    with open(output_json, "w") as f:
+        json.dump(coco_data, f, indent=2)
+    print(f" Saved {split_name} annotations to {output_json} with {len(images)} images and {len(annotations)} annotations.")
